@@ -1,16 +1,17 @@
 apiVersion: req.nephio.org/v1alpha1
 kind: Interface
 metadata:
-  name: n3
+  name: n2
   annotations:
     # interface-fn reads these annotations to look up the IP pool and writes
-    # the allocated CIDR back into SrsRanDeployment.spec.interfaces.n3.
-    nephio.org/network-name: n3
+    # the allocated CIDR back into SrsRanDeployment.spec.interfaces.n2.
+    # N2 carries NGAP signalling between the CU-CP and the AMF.
+    nephio.org/network-name: n2
     config.kubernetes.io/local-config: "true"
     specializer.nephio.org/owner: workload.nephio.org/v1alpha1.SrsRanDeployment.srsran-example
     specializer.nephio.org/namespace: srsran-example
 spec:
-  # vpc-ran: carries GTP-U user-plane traffic between CU-UP and the UPF.
+  # vpc-ran: public RAN network reachable by the core (AMF, UPF).
   networkInstance:
     name: vpc-ran
   cniType: macvlan

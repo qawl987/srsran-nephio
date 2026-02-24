@@ -14,6 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+// Package controllers implements the SrsRanDeployment reconciler.
+//
+// Architecture: three SEPARATE pods are deployed per SrsRanDeployment:
+//
+//	CU-CP  – binds N2 (NGAP→AMF), E1 (E1AP→CU-UP), F1C (F1-AP→DU)
+//	CU-UP  – binds N3 (GTP-U→UPF), E1 (E1AP←CU-CP), F1U (GTP-U→DU)
+//	DU     – binds F1C (F1-AP←CU-CP), F1U (GTP-U←CU-UP), ZMQ RF
+//
+// Because the three components run in separate pods, ALL inter-component
+// addresses come from Nephio-injected IPAM IPs exposed via Kubernetes Services.
+// Loopback (127.x.x.x) addresses must never appear in generated configs.
 package controllers
 
 import (
@@ -78,12 +89,13 @@ func (r *SrsRanDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 //
 // High-level flow:
 //  1. Fetch the SrsRanDeployment CR.
-//  2. Determine effective topology (single vs multi) from spec.
-//  3. Render and reconcile ConfigMaps (DU config + QoS).
-//  4. Reconcile the DU Deployment.
-//  5. If single topology → reconcile one UE Deployment.
-//     If multi topology  → reconcile RadioBreaker Deployment + N UE Deployments.
-//  6. Update status.
+//  2. Validate all 5 Nephio IPAM-injected IPs are present.
+//  3. Reconcile QoS ConfigMap (DU-mounted, based on 5QI).
+//  4. Reconcile CU-CP  ConfigMap + Deployment  (N2, E1, F1C bindings).
+//  5. Reconcile CU-UP  ConfigMap + Deployment  (N3, E1, F1U bindings).
+//  6. Reconcile DU     ConfigMap + Deployment  (F1C, F1U, ZMQ RF bindings).
+//  7. Reconcile ZMQ UE topology (single or RadioBreaker multi).
+//  8. Update status.
 func (r *SrsRanDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx).WithValues("SrsRanDeployment", req.NamespacedName)
 
@@ -98,111 +110,195 @@ func (r *SrsRanDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return reconcile.Result{}, err
 	}
 
-	// ── 2. Validate IPAM injection ───────────────────────────────────────────
-	// The Nephio pipeline (interface-fn + ipam-fn) must have injected real IPs
-	// before the operator can proceed. Requeue with backoff if not yet ready.
-	n3IP, err := extractHost(cr.Spec.Interfaces.N3.IPAddress)
-	if err != nil {
-		log.Info("N3 IP not yet injected by Nephio IPAM; requeueing",
-			"rawField", cr.Spec.Interfaces.N3.IPAddress)
-		return reconcile.Result{RequeueAfter: time.Duration(requeueAfterSeconds) * time.Second}, nil
+	// ── 2. Validate all Nephio IPAM-injected IPs ─────────────────────────────
+	// The Nephio pipeline (interface-fn) must inject real IPs into all five
+	// interface fields before the operator can generate valid configs.
+	// CU-CP, CU-UP, and DU run in SEPARATE pods; cross-pod addresses must be
+	// real routed IPs – loopback 127.x.x.x will not work.
+	type ifCheck struct{ name, raw string }
+	for _, ifc := range []ifCheck{
+		{"n2", cr.Spec.Interfaces.N2.IPAddress},
+		{"n3", cr.Spec.Interfaces.N3.IPAddress},
+		{"e1", cr.Spec.Interfaces.E1.IPAddress},
+		{"f1c", cr.Spec.Interfaces.F1C.IPAddress},
+		{"f1u", cr.Spec.Interfaces.F1U.IPAddress},
+	} {
+		if _, err := extractHost(ifc.raw); err != nil {
+			log.Info("Interface IP not yet injected by Nephio IPAM; requeueing",
+				"interface", ifc.name, "raw", ifc.raw)
+			return reconcile.Result{RequeueAfter: time.Duration(requeueAfterSeconds) * time.Second}, nil
+		}
 	}
 
-	f1IP, err := extractHost(cr.Spec.Interfaces.F1.IPAddress)
-	if err != nil {
-		log.Info("F1 IP not yet injected by Nephio IPAM; requeueing",
-			"rawField", cr.Spec.Interfaces.F1.IPAddress)
-		return reconcile.Result{RequeueAfter: time.Duration(requeueAfterSeconds) * time.Second}, nil
-	}
+	n2IP, _ := extractHost(cr.Spec.Interfaces.N2.IPAddress)
+	n3IP, _ := extractHost(cr.Spec.Interfaces.N3.IPAddress)
+	e1IP, _ := extractHost(cr.Spec.Interfaces.E1.IPAddress)
+	f1cIP, _ := extractHost(cr.Spec.Interfaces.F1C.IPAddress)
+	f1uIP, _ := extractHost(cr.Spec.Interfaces.F1U.IPAddress)
 
-	// ── 3. Determine effective topology ──────────────────────────────────────
+	// ── 3. Determine effective ZMQ topology ──────────────────────────────────
 	topology := effectiveTopology(cr)
 	log.Info("Resolved topology", "type", topology, "ueCount", cr.Spec.Topology.UECount)
 
-	// ── 4. Reconcile QoS ConfigMap ───────────────────────────────────────────
+	// ── 4. QoS ConfigMap (mounted into DU) ───────────────────────────────────
 	qosData, err := renderQoSConfigMap(cr.Spec.SliceIntent)
 	if err != nil {
 		log.Error(err, "Failed to render QoS ConfigMap")
 		return reconcile.Result{}, err
 	}
-	qosConfigMapName := cr.Name + "-qos"
-	qosCM := buildConfigMap(qosConfigMapName, cr.Namespace, map[string]string{
-		"qos.yaml": qosData,
-	})
-	if err := r.reconcileConfigMap(ctx, cr, qosCM, log); err != nil {
+	qosCMName := cr.Name + "-qos"
+	if err := r.reconcileConfigMap(ctx, cr,
+		buildConfigMap(qosCMName, cr.Namespace, map[string]string{"qos.yaml": qosData}),
+		log); err != nil {
 		return reconcile.Result{}, err
 	}
 
-	// ── 5. Reconcile DU ConfigMap ─────────────────────────────────────────────
-	// The DU config ZMQ target depends on topology:
-	//   single → point directly at UE (staticlocal IP via loopback/pod IP)
-	//   multi  → point at RadioBreaker proxy
-	var duZMQTarget string
-	if topology == srsranov1alpha1.TopologySingle {
-		// In single-UE mode the ZMQ loopback is between two containers in the
-		// same namespace; we use 127.0.0.1 as the binding address.
-		duZMQTarget = "127.0.0.1"
-	} else {
-		// Multi-UE: RadioBreaker runs as a separate pod; its Service name is
-		// predictable so we use the K8s DNS name.
-		duZMQTarget = fmt.Sprintf("%s-radiobreaker.%s.svc.cluster.local",
-			cr.Name, cr.Namespace)
+	// ── 5. CU-CP ConfigMap + Deployment ──────────────────────────────────────
+	// CU-CP binds: N2 (NGAP→AMF), E1 (E1AP server), F1C (F1-AP server).
+	cucpCfgData, err := renderCUCPConfig(CUCPConfigValues{
+		N2BindAddr:  n2IP,
+		AMFAddr:     cr.Spec.Interfaces.N2.Gateway, // Gateway = AMF IP hint
+		E1BindAddr:  e1IP,
+		F1CBindAddr: f1cIP,
+		PLMN:        cr.Spec.Topology.PLMN,
+		TAC:         cr.Spec.Topology.TAC,
+	})
+	if err != nil {
+		log.Error(err, "Failed to render CU-CP config")
+		return reconcile.Result{}, err
+	}
+	cucpCMName := cr.Name + "-cucp"
+	if err := r.reconcileConfigMap(ctx, cr,
+		buildConfigMap(cucpCMName, cr.Namespace, map[string]string{"cu_cp.yml": cucpCfgData}),
+		log); err != nil {
+		return reconcile.Result{}, err
+	}
+	cucpCM := new(apiv1.ConfigMap)
+	_ = r.Client.Get(ctx, types.NamespacedName{Name: cucpCMName, Namespace: cr.Namespace}, cucpCM)
+	if err := r.reconcileDeployment(ctx, cr,
+		buildCUCPDeployment(cr, cucpCMName, cucpCM.ResourceVersion), log); err != nil {
+		return reconcile.Result{}, err
+	}
+	// CU-CP Service: exposes E1AP and F1-AP so CU-UP and DU can reach it.
+	if err := r.reconcileService(ctx, cr, buildCUCPService(cr), log); err != nil {
+		return reconcile.Result{}, err
 	}
 
+	// ── 6. CU-UP ConfigMap + Deployment ──────────────────────────────────────
+	// CU-UP binds: N3 (GTP-U→UPF), E1 (E1AP client→CU-CP), F1U (GTP-U→DU).
+	// E1 connects to the CU-CP Service, NOT a loopback address.
+	cucpSvcDNS := fmt.Sprintf("%s-cucp.%s.svc.cluster.local", cr.Name, cr.Namespace)
+	cuupCfgData, err := renderCUUPConfig(CUUPConfigValues{
+		E1CUCPAddr:  cucpSvcDNS,
+		E1BindAddr:  e1IP,
+		N3BindAddr:  n3IP,
+		F1UBindAddr: f1uIP,
+	})
+	if err != nil {
+		log.Error(err, "Failed to render CU-UP config")
+		return reconcile.Result{}, err
+	}
+	cuupCMName := cr.Name + "-cuup"
+	if err := r.reconcileConfigMap(ctx, cr,
+		buildConfigMap(cuupCMName, cr.Namespace, map[string]string{"cu_up.yml": cuupCfgData}),
+		log); err != nil {
+		return reconcile.Result{}, err
+	}
+	cuupCM := new(apiv1.ConfigMap)
+	_ = r.Client.Get(ctx, types.NamespacedName{Name: cuupCMName, Namespace: cr.Namespace}, cuupCM)
+	if err := r.reconcileDeployment(ctx, cr,
+		buildCUUPDeployment(cr, cuupCMName, cuupCM.ResourceVersion), log); err != nil {
+		return reconcile.Result{}, err
+	}
+
+	// ── 7. DU ConfigMap + Deployment ─────────────────────────────────────────
+	// DU binds: F1C (F1-AP client→CU-CP), F1U (GTP-U client→CU-UP), ZMQ RF.
+	// ZMQ target depends on topology:
+	//   single → UE Service DNS
+	//   multi  → RadioBreaker Service DNS
+	var zmqTarget string
+	if topology == srsranov1alpha1.TopologySingle {
+		zmqTarget = fmt.Sprintf("%s-ue-0.%s.svc.cluster.local", cr.Name, cr.Namespace)
+	} else {
+		zmqTarget = fmt.Sprintf("%s-radiobreaker.%s.svc.cluster.local", cr.Name, cr.Namespace)
+	}
 	duCfgData, err := renderDUConfig(DUConfigValues{
-		F1CUCPAddr: f1IP,
-		F1BindAddr: f1IP,
-		N3Addr:     n3IP,
-		ZMQTarget:  duZMQTarget,
-		ZMQTXPort:  zmqBasePort,
-		ZMQRXPort:  zmqBasePort + 1,
-		PLMN:       cr.Spec.Topology.PLMN,
-		TAC:        cr.Spec.Topology.TAC,
-		SliceType:  cr.Spec.SliceIntent.Type,
+		F1CUCPAddr:  cucpSvcDNS,
+		F1CBindAddr: f1cIP,
+		F1UBindAddr: f1uIP,
+		ZMQTarget:   zmqTarget,
+		ZMQTXPort:   zmqBasePort,
+		ZMQRXPort:   zmqBasePort + 1,
+		PLMN:        cr.Spec.Topology.PLMN,
+		TAC:         cr.Spec.Topology.TAC,
+		SliceType:   cr.Spec.SliceIntent.Type,
 	})
 	if err != nil {
 		log.Error(err, "Failed to render DU config")
 		return reconcile.Result{}, err
 	}
-	duConfigMapName := cr.Name + "-du"
-	duCM := buildConfigMap(duConfigMapName, cr.Namespace, map[string]string{
-		"du.yml": duCfgData,
-	})
-	if err := r.reconcileConfigMap(ctx, cr, duCM, log); err != nil {
+	duCMName := cr.Name + "-du"
+	if err := r.reconcileConfigMap(ctx, cr,
+		buildConfigMap(duCMName, cr.Namespace, map[string]string{"du.yml": duCfgData}),
+		log); err != nil {
+		return reconcile.Result{}, err
+	}
+	duCM := new(apiv1.ConfigMap)
+	_ = r.Client.Get(ctx, types.NamespacedName{Name: duCMName, Namespace: cr.Namespace}, duCM)
+	if err := r.reconcileDeployment(ctx, cr,
+		buildDUDeployment(cr, duCMName, qosCMName, duCM.ResourceVersion), log); err != nil {
 		return reconcile.Result{}, err
 	}
 
-	// Retrieve the DU ConfigMap version so that pod template annotations force
-	// rolling restarts when the ConfigMap changes.
-	currentDUCM := new(apiv1.ConfigMap)
-	if err := r.Client.Get(ctx,
-		types.NamespacedName{Name: duConfigMapName, Namespace: cr.Namespace},
-		currentDUCM); err != nil {
-		log.Error(err, "Failed to fetch DU ConfigMap after reconcile")
-		return reconcile.Result{}, err
-	}
-	duCMVersion := currentDUCM.ResourceVersion
-
-	// ── 6. Reconcile DU Deployment ───────────────────────────────────────────
-	duDeployment := buildDUDeployment(cr, duConfigMapName, qosConfigMapName, duCMVersion)
-	if err := r.reconcileDeployment(ctx, cr, duDeployment, log); err != nil {
-		return reconcile.Result{}, err
-	}
-
-	// ── 7. Reconcile topology-specific resources ──────────────────────────────
+	// ── 8. ZMQ UE topology ───────────────────────────────────────────────────
 	switch topology {
 	case srsranov1alpha1.TopologySingle:
-		if err := r.reconcileSingleUE(ctx, cr, duConfigMapName, log); err != nil {
+		// One UE; ZMQ TX/RX port pair 2000/2001, target = DU Service DNS.
+		// Note: in single topology the DU uses tcp://<ue-svc>:2000 to reach UE.
+		duSvcDNS := fmt.Sprintf("%s-du.%s.svc.cluster.local", cr.Name, cr.Namespace)
+		ueCM, err := r.buildUEConfigMap(cr, 0, duSvcDNS, zmqBasePort)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		if err := r.reconcileConfigMap(ctx, cr, ueCM, log); err != nil {
+			return reconcile.Result{}, err
+		}
+		if err := r.reconcileDeployment(ctx, cr, buildUEDeployment(cr, 0, ueCM.Name), log); err != nil {
+			return reconcile.Result{}, err
+		}
+		// DU Service: exposes ZMQ RX so UE can connect.
+		if err := r.reconcileService(ctx, cr, buildDUService(cr), log); err != nil {
 			return reconcile.Result{}, err
 		}
 
 	case srsranov1alpha1.TopologyMulti:
-		if err := r.reconcileMultiUE(ctx, cr, log); err != nil {
+		// RadioBreaker ZMQ proxy fans out DU → N UEs.
+		//   DU  TX → RB RX : tcp://<rb-svc>:2000
+		//   DU  RX ← RB TX : tcp://<rb-svc>:2001
+		//   UE[i] ZMQ TX/RX: tcp://<rb-svc>:(2000+i*2) / (2001+i*2)
+		if err := r.reconcileDeployment(ctx, cr, buildRadioBreakerDeployment(cr), log); err != nil {
 			return reconcile.Result{}, err
+		}
+		if err := r.reconcileService(ctx, cr, buildRadioBreakerService(cr), log); err != nil {
+			return reconcile.Result{}, err
+		}
+		rbSvcDNS := fmt.Sprintf("%s-radiobreaker.%s.svc.cluster.local", cr.Name, cr.Namespace)
+		for i := 0; i < cr.Spec.Topology.UECount; i++ {
+			uePort := zmqBasePort + i*2
+			ueCM, err := r.buildUEConfigMap(cr, i, rbSvcDNS, uePort)
+			if err != nil {
+				return reconcile.Result{}, err
+			}
+			if err := r.reconcileConfigMap(ctx, cr, ueCM, log); err != nil {
+				return reconcile.Result{}, err
+			}
+			if err := r.reconcileDeployment(ctx, cr, buildUEDeployment(cr, i, ueCM.Name), log); err != nil {
+				return reconcile.Result{}, err
+			}
 		}
 	}
 
-	// ── 8. Update status ─────────────────────────────────────────────────────
+	// ── 9. Update status ─────────────────────────────────────────────────────
 	if err := r.syncStatus(ctx, cr, topology); err != nil {
 		log.Error(err, "Failed to sync status")
 		return reconcile.Result{}, err
@@ -212,11 +308,8 @@ func (r *SrsRanDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	return reconcile.Result{}, nil
 }
 
-// ─── Topology helpers ────────────────────────────────────────────────────────
+// ─── Topology helper ─────────────────────────────────────────────────────────
 
-// effectiveTopology returns the actual topology to deploy.
-// If the user explicitly sets spec.topology.type it is honoured; otherwise
-// it is inferred from ueCount.
 func effectiveTopology(cr *srsranov1alpha1.SrsRanDeployment) srsranov1alpha1.TopologyType {
 	if cr.Spec.Topology.Type != "" {
 		return cr.Spec.Topology.Type
@@ -227,137 +320,159 @@ func effectiveTopology(cr *srsranov1alpha1.SrsRanDeployment) srsranov1alpha1.Top
 	return srsranov1alpha1.TopologySingle
 }
 
-// ─── Single-UE topology ───────────────────────────────────────────────────────
-
-// reconcileSingleUE creates/updates one UE Deployment wired directly to the DU
-// via ZMQ on localhost ports 2000/2001.
-func (r *SrsRanDeploymentReconciler) reconcileSingleUE(
-	ctx context.Context,
-	cr *srsranov1alpha1.SrsRanDeployment,
-	duConfigMapName string,
-	log interface{ Info(string, ...any) },
-) error {
-	ueCM, err := r.buildUEConfigMap(cr, 0, "127.0.0.1", zmqBasePort)
-	if err != nil {
-		return err
-	}
-	if err := r.reconcileConfigMap(ctx, cr, ueCM, log); err != nil {
-		return err
-	}
-	ueDeployment := buildUEDeployment(cr, 0, ueCM.Name)
-	return r.reconcileDeployment(ctx, cr, ueDeployment, log)
-}
-
-// ─── Multi-UE topology ────────────────────────────────────────────────────────
-
-// reconcileMultiUE creates/updates:
-//  1. A RadioBreaker Deployment — a ZMQ proxy that fans-out from the DU to N UEs.
-//  2. N UE Deployments, each pointing at the RadioBreaker with incrementing ports.
-//
-// ZMQ port assignment:
-//
-//	DU TX  → RadioBreaker RX : tcp://<rb>:2000
-//	DU RX  ← RadioBreaker TX : tcp://<rb>:2001
-//	UE[i]  → RadioBreaker RX : tcp://<rb>:(2000 + i*2)
-//	UE[i]  ← RadioBreaker TX : tcp://<rb>:(2001 + i*2)
-func (r *SrsRanDeploymentReconciler) reconcileMultiUE(
-	ctx context.Context,
-	cr *srsranov1alpha1.SrsRanDeployment,
-	log interface{ Info(string, ...any) },
-) error {
-	rbName := cr.Name + "-radiobreaker"
-	rbServiceDNS := fmt.Sprintf("%s.%s.svc.cluster.local", rbName, cr.Namespace)
-
-	// 7a. RadioBreaker Deployment
-	rbDeployment := buildRadioBreakerDeployment(cr)
-	if err := r.reconcileDeployment(ctx, cr, rbDeployment, log); err != nil {
-		return err
-	}
-
-	// 7b. RadioBreaker Service (ClusterIP so UEs can reach it by DNS)
-	rbService := buildRadioBreakerService(cr)
-	if err := r.reconcileService(ctx, cr, rbService, log); err != nil {
-		return err
-	}
-
-	// 7c. N UE Deployments
-	for i := 0; i < cr.Spec.Topology.UECount; i++ {
-		uePort := zmqBasePort + i*2
-		ueCM, err := r.buildUEConfigMap(cr, i, rbServiceDNS, uePort)
-		if err != nil {
-			return err
-		}
-		if err := r.reconcileConfigMap(ctx, cr, ueCM, log); err != nil {
-			return err
-		}
-		ueDeployment := buildUEDeployment(cr, i, ueCM.Name)
-		if err := r.reconcileDeployment(ctx, cr, ueDeployment, log); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // ─── Resource builders ───────────────────────────────────────────────────────
 
-// buildConfigMap is a convenience constructor.
 func buildConfigMap(name, namespace string, data map[string]string) *apiv1.ConfigMap {
 	return &apiv1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-		},
-		Data: data,
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Data:       data,
 	}
 }
 
-// buildDUDeployment returns the DU gNB Deployment object.
-func buildDUDeployment(
-	cr *srsranov1alpha1.SrsRanDeployment,
-	duCMName, qosCMName, cmVersion string,
-) *appsv1.Deployment {
+// buildCUCPDeployment returns the CU-CP pod Deployment.
+// CU-CP binds N2 (NGAP→AMF), E1 (E1AP server for CU-UP), F1C (F1-AP for DU).
+func buildCUCPDeployment(cr *srsranov1alpha1.SrsRanDeployment, cmName, cmVersion string) *appsv1.Deployment {
+	replicas := int32(1)
+	name := cr.Name + "-cucp"
+	img := cr.Spec.CUCPImage
+	if img == "" {
+		img = "docker.io/softwareradiosystems/srsran-project:latest"
+	}
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cr.Namespace, Labels: labelsFor(cr, "cucp")},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: labelsFor(cr, "cucp")},
+			Template: apiv1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      labelsFor(cr, "cucp"),
+					Annotations: map[string]string{ConfigMapVersionAnnotation: cmVersion},
+				},
+				Spec: apiv1.PodSpec{
+					Containers: []apiv1.Container{{
+						Name:            "cucp",
+						Image:           img,
+						ImagePullPolicy: apiv1.PullAlways,
+						Command:         []string{"/usr/local/bin/srscu_cp", "-c", "/srsran/config/cu_cp.yml"},
+						SecurityContext: &apiv1.SecurityContext{
+							Capabilities: &apiv1.Capabilities{Add: []apiv1.Capability{"NET_ADMIN"}},
+						},
+						VolumeMounts: []apiv1.VolumeMount{
+							{Name: "cucp-config", MountPath: "/srsran/config"},
+						},
+					}},
+					Volumes: []apiv1.Volume{{
+						Name: "cucp-config",
+						VolumeSource: apiv1.VolumeSource{
+							ConfigMap: &apiv1.ConfigMapVolumeSource{
+								LocalObjectReference: apiv1.LocalObjectReference{Name: cmName},
+							},
+						},
+					}},
+					RestartPolicy: apiv1.RestartPolicyAlways,
+				},
+			},
+		},
+	}
+}
+
+// buildCUCPService exposes E1AP (port 38462) and F1-AP (port 38472) so that
+// CU-UP and DU pods can reach the CU-CP by stable DNS name.
+func buildCUCPService(cr *srsranov1alpha1.SrsRanDeployment) *apiv1.Service {
+	name := cr.Name + "-cucp"
+	return &apiv1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cr.Namespace, Labels: labelsFor(cr, "cucp")},
+		Spec: apiv1.ServiceSpec{
+			Selector: labelsFor(cr, "cucp"),
+			Ports: []apiv1.ServicePort{
+				{Name: "e1ap", Port: 38462, Protocol: apiv1.ProtocolTCP},
+				{Name: "f1ap", Port: 38472, Protocol: apiv1.ProtocolTCP},
+			},
+			Type: apiv1.ServiceTypeClusterIP,
+		},
+	}
+}
+
+// buildCUUPDeployment returns the CU-UP pod Deployment.
+// CU-UP binds N3 (GTP-U→UPF), E1 (E1AP client→CU-CP Service), F1U (GTP-U→DU).
+func buildCUUPDeployment(cr *srsranov1alpha1.SrsRanDeployment, cmName, cmVersion string) *appsv1.Deployment {
+	replicas := int32(1)
+	name := cr.Name + "-cuup"
+	img := cr.Spec.CUUPImage
+	if img == "" {
+		img = "docker.io/softwareradiosystems/srsran-project:latest"
+	}
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cr.Namespace, Labels: labelsFor(cr, "cuup")},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: labelsFor(cr, "cuup")},
+			Template: apiv1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      labelsFor(cr, "cuup"),
+					Annotations: map[string]string{ConfigMapVersionAnnotation: cmVersion},
+				},
+				Spec: apiv1.PodSpec{
+					Containers: []apiv1.Container{{
+						Name:            "cuup",
+						Image:           img,
+						ImagePullPolicy: apiv1.PullAlways,
+						Command:         []string{"/usr/local/bin/srscu_up", "-c", "/srsran/config/cu_up.yml"},
+						SecurityContext: &apiv1.SecurityContext{
+							Capabilities: &apiv1.Capabilities{Add: []apiv1.Capability{"NET_ADMIN"}},
+						},
+						VolumeMounts: []apiv1.VolumeMount{
+							{Name: "cuup-config", MountPath: "/srsran/config"},
+						},
+					}},
+					Volumes: []apiv1.Volume{{
+						Name: "cuup-config",
+						VolumeSource: apiv1.VolumeSource{
+							ConfigMap: &apiv1.ConfigMapVolumeSource{
+								LocalObjectReference: apiv1.LocalObjectReference{Name: cmName},
+							},
+						},
+					}},
+					RestartPolicy: apiv1.RestartPolicyAlways,
+				},
+			},
+		},
+	}
+}
+
+// buildDUDeployment returns the DU pod Deployment.
+// DU binds F1C (F1-AP→CU-CP), F1U (GTP-U→CU-UP), ZMQ RF (→UE or RadioBreaker).
+func buildDUDeployment(cr *srsranov1alpha1.SrsRanDeployment, duCMName, qosCMName, cmVersion string) *appsv1.Deployment {
 	replicas := int32(1)
 	name := cr.Name + "-du"
-
+	img := cr.Spec.DUImage
+	if img == "" {
+		img = "docker.io/softwareradiosystems/srsran-project:latest"
+	}
 	return &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: cr.Namespace,
-			Labels:    labelsFor(cr, "du"),
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cr.Namespace, Labels: labelsFor(cr, "du")},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
 			Selector: &metav1.LabelSelector{MatchLabels: labelsFor(cr, "du")},
 			Template: apiv1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: labelsFor(cr, "du"),
-					Annotations: map[string]string{
-						ConfigMapVersionAnnotation: cmVersion,
-					},
+					Labels:      labelsFor(cr, "du"),
+					Annotations: map[string]string{ConfigMapVersionAnnotation: cmVersion},
 				},
 				Spec: apiv1.PodSpec{
-					// NET_ADMIN is required for GTP-U tunnel creation.
-					InitContainers: []apiv1.Container{},
-					Containers: []apiv1.Container{
-						{
-							Name:            "du",
-							Image:           cr.Spec.DUImage,
-							ImagePullPolicy: apiv1.PullAlways,
-							SecurityContext: &apiv1.SecurityContext{
-								Capabilities: &apiv1.Capabilities{
-									Add: []apiv1.Capability{"NET_ADMIN"},
-								},
-							},
-							Command: []string{
-								"/usr/local/bin/gnb",
-								"-c", "/srsran/config/du.yml",
-							},
-							VolumeMounts: []apiv1.VolumeMount{
-								{Name: "du-config", MountPath: "/srsran/config"},
-								{Name: "qos-config", MountPath: "/srsran/qos"},
-							},
+					Containers: []apiv1.Container{{
+						Name:            "du",
+						Image:           img,
+						ImagePullPolicy: apiv1.PullAlways,
+						Command:         []string{"/usr/local/bin/gnb", "-c", "/srsran/config/du.yml"},
+						SecurityContext: &apiv1.SecurityContext{
+							Capabilities: &apiv1.Capabilities{Add: []apiv1.Capability{"NET_ADMIN"}},
 						},
-					},
+						VolumeMounts: []apiv1.VolumeMount{
+							{Name: "du-config", MountPath: "/srsran/config"},
+							{Name: "qos-config", MountPath: "/srsran/qos"},
+						},
+					}},
 					Volumes: []apiv1.Volume{
 						{
 							Name: "du-config",
@@ -383,45 +498,55 @@ func buildDUDeployment(
 	}
 }
 
-// buildUEDeployment returns a single UE Deployment. Index i is used to give
-// each pod a unique name and to distinguish log output.
+// buildDUService exposes the DU ZMQ RX port so the single UE pod can connect.
+func buildDUService(cr *srsranov1alpha1.SrsRanDeployment) *apiv1.Service {
+	name := cr.Name + "-du"
+	return &apiv1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cr.Namespace, Labels: labelsFor(cr, "du")},
+		Spec: apiv1.ServiceSpec{
+			Selector: labelsFor(cr, "du"),
+			Ports: []apiv1.ServicePort{
+				{Name: "zmq-tx", Port: int32(zmqBasePort), Protocol: apiv1.ProtocolTCP},
+				{Name: "zmq-rx", Port: int32(zmqBasePort + 1), Protocol: apiv1.ProtocolTCP},
+			},
+			Type: apiv1.ServiceTypeClusterIP,
+		},
+	}
+}
+
+// buildUEDeployment returns a single UE Deployment for the given index.
 func buildUEDeployment(cr *srsranov1alpha1.SrsRanDeployment, index int, ueCMName string) *appsv1.Deployment {
 	replicas := int32(1)
 	name := fmt.Sprintf("%s-ue-%d", cr.Name, index)
-
+	img := cr.Spec.UEImage
+	if img == "" {
+		img = "docker.io/softwareradiosystems/srsue:latest"
+	}
 	return &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: cr.Namespace,
-			Labels:    labelsForUE(cr, index),
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cr.Namespace, Labels: labelsForUE(cr, index)},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
 			Selector: &metav1.LabelSelector{MatchLabels: labelsForUE(cr, index)},
 			Template: apiv1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labelsForUE(cr, index)},
 				Spec: apiv1.PodSpec{
-					Containers: []apiv1.Container{
-						{
-							Name:            "ue",
-							Image:           cr.Spec.UEImage,
-							ImagePullPolicy: apiv1.PullAlways,
-							Command:         []string{"/usr/local/bin/srsue", "/srsran/config/ue.conf"},
-							VolumeMounts: []apiv1.VolumeMount{
-								{Name: "ue-config", MountPath: "/srsran/config"},
+					Containers: []apiv1.Container{{
+						Name:            "ue",
+						Image:           img,
+						ImagePullPolicy: apiv1.PullAlways,
+						Command:         []string{"/usr/local/bin/srsue", "/srsran/config/ue.conf"},
+						VolumeMounts: []apiv1.VolumeMount{
+							{Name: "ue-config", MountPath: "/srsran/config"},
+						},
+					}},
+					Volumes: []apiv1.Volume{{
+						Name: "ue-config",
+						VolumeSource: apiv1.VolumeSource{
+							ConfigMap: &apiv1.ConfigMapVolumeSource{
+								LocalObjectReference: apiv1.LocalObjectReference{Name: ueCMName},
 							},
 						},
-					},
-					Volumes: []apiv1.Volume{
-						{
-							Name: "ue-config",
-							VolumeSource: apiv1.VolumeSource{
-								ConfigMap: &apiv1.ConfigMapVolumeSource{
-									LocalObjectReference: apiv1.LocalObjectReference{Name: ueCMName},
-								},
-							},
-						},
-					},
+					}},
 					RestartPolicy: apiv1.RestartPolicyAlways,
 				},
 			},
@@ -429,15 +554,19 @@ func buildUEDeployment(cr *srsranov1alpha1.SrsRanDeployment, index int, ueCMName
 	}
 }
 
-// buildRadioBreakerDeployment returns a ZMQ concentrator (RadioBreaker) Deployment.
-// The RadioBreaker acts as a transparent ZMQ proxy between the DU and N UEs,
-// allowing the DU to communicate with one ZMQ socket regardless of UE count.
+// buildRadioBreakerDeployment returns the ZMQ concentrator Deployment.
+// In multi-UE topology the DU connects to this proxy; the proxy fans out to N UEs.
+// ZMQ port layout:
+//
+//	DU-facing  TX:2000  RX:2001
+//	UE[i]-facing TX:(2000+i*2)  RX:(2001+i*2)
 func buildRadioBreakerDeployment(cr *srsranov1alpha1.SrsRanDeployment) *appsv1.Deployment {
 	replicas := int32(1)
 	name := cr.Name + "-radiobreaker"
-
-	// Build the ZMQ port list for the N UEs so they can be passed as env vars
-	// to the RadioBreaker. Each UE pair: (2000+i*2, 2001+i*2).
+	img := cr.Spec.RadioBreakerImage
+	if img == "" {
+		img = "docker.io/softwareradiosystems/radio-breaker:latest"
+	}
 	uePorts := ""
 	for i := 0; i < cr.Spec.Topology.UECount; i++ {
 		if i > 0 {
@@ -445,35 +574,26 @@ func buildRadioBreakerDeployment(cr *srsranov1alpha1.SrsRanDeployment) *appsv1.D
 		}
 		uePorts += fmt.Sprintf("%d:%d", zmqBasePort+i*2, zmqBasePort+i*2+1)
 	}
-
 	return &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: cr.Namespace,
-			Labels:    labelsFor(cr, "radiobreaker"),
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cr.Namespace, Labels: labelsFor(cr, "radiobreaker")},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
 			Selector: &metav1.LabelSelector{MatchLabels: labelsFor(cr, "radiobreaker")},
 			Template: apiv1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labelsFor(cr, "radiobreaker")},
 				Spec: apiv1.PodSpec{
-					Containers: []apiv1.Container{
-						{
-							Name:            "radiobreaker",
-							Image:           cr.Spec.RadioBreakerImage,
-							ImagePullPolicy: apiv1.PullAlways,
-							Env: []apiv1.EnvVar{
-								// DU-facing ZMQ socket addresses.
-								{Name: "DU_TX_PORT", Value: fmt.Sprintf("%d", zmqBasePort)},
-								{Name: "DU_RX_PORT", Value: fmt.Sprintf("%d", zmqBasePort+1)},
-								// UE-facing port pairs: "2000:2001,2002:2003,..."
-								{Name: "UE_PORTS", Value: uePorts},
-								{Name: "NUM_UES", Value: fmt.Sprintf("%d", cr.Spec.Topology.UECount)},
-							},
-							Ports: buildRadioBreakerContainerPorts(cr.Spec.Topology.UECount),
+					Containers: []apiv1.Container{{
+						Name:            "radiobreaker",
+						Image:           img,
+						ImagePullPolicy: apiv1.PullAlways,
+						Env: []apiv1.EnvVar{
+							{Name: "DU_TX_PORT", Value: fmt.Sprintf("%d", zmqBasePort)},
+							{Name: "DU_RX_PORT", Value: fmt.Sprintf("%d", zmqBasePort+1)},
+							{Name: "UE_PORTS", Value: uePorts},
+							{Name: "NUM_UES", Value: fmt.Sprintf("%d", cr.Spec.Topology.UECount)},
 						},
-					},
+						Ports: buildRadioBreakerContainerPorts(cr.Spec.Topology.UECount),
+					}},
 					RestartPolicy: apiv1.RestartPolicyAlways,
 				},
 			},
@@ -481,36 +601,21 @@ func buildRadioBreakerDeployment(cr *srsranov1alpha1.SrsRanDeployment) *appsv1.D
 	}
 }
 
-// buildRadioBreakerContainerPorts exposes all ZMQ ports so the K8s Service
-// can route them correctly.
 func buildRadioBreakerContainerPorts(ueCount int) []apiv1.ContainerPort {
-	// Always expose the DU-facing ports.
 	ports := []apiv1.ContainerPort{
 		{Name: "du-tx", ContainerPort: int32(zmqBasePort), Protocol: apiv1.ProtocolTCP},
 		{Name: "du-rx", ContainerPort: int32(zmqBasePort + 1), Protocol: apiv1.ProtocolTCP},
 	}
-	// Expose per-UE ports.
 	for i := 0; i < ueCount; i++ {
-		txPort := int32(zmqBasePort + i*2)
-		rxPort := int32(zmqBasePort + i*2 + 1)
 		ports = append(ports,
-			apiv1.ContainerPort{
-				Name:          fmt.Sprintf("ue%d-tx", i),
-				ContainerPort: txPort,
-				Protocol:      apiv1.ProtocolTCP,
-			},
-			apiv1.ContainerPort{
-				Name:          fmt.Sprintf("ue%d-rx", i),
-				ContainerPort: rxPort,
-				Protocol:      apiv1.ProtocolTCP,
-			},
+			apiv1.ContainerPort{Name: fmt.Sprintf("ue%d-tx", i), ContainerPort: int32(zmqBasePort + i*2), Protocol: apiv1.ProtocolTCP},
+			apiv1.ContainerPort{Name: fmt.Sprintf("ue%d-rx", i), ContainerPort: int32(zmqBasePort + i*2 + 1), Protocol: apiv1.ProtocolTCP},
 		)
 	}
 	return ports
 }
 
-// buildRadioBreakerService returns a ClusterIP Service for the RadioBreaker
-// so that UEs can reach it via predictable DNS.
+// buildRadioBreakerService returns a ClusterIP Service exposing all ZMQ ports.
 func buildRadioBreakerService(cr *srsranov1alpha1.SrsRanDeployment) *apiv1.Service {
 	name := cr.Name + "-radiobreaker"
 	ports := []apiv1.ServicePort{
@@ -519,24 +624,12 @@ func buildRadioBreakerService(cr *srsranov1alpha1.SrsRanDeployment) *apiv1.Servi
 	}
 	for i := 0; i < cr.Spec.Topology.UECount; i++ {
 		ports = append(ports,
-			apiv1.ServicePort{
-				Name:     fmt.Sprintf("ue%d-tx", i),
-				Port:     int32(zmqBasePort + i*2),
-				Protocol: apiv1.ProtocolTCP,
-			},
-			apiv1.ServicePort{
-				Name:     fmt.Sprintf("ue%d-rx", i),
-				Port:     int32(zmqBasePort + i*2 + 1),
-				Protocol: apiv1.ProtocolTCP,
-			},
+			apiv1.ServicePort{Name: fmt.Sprintf("ue%d-tx", i), Port: int32(zmqBasePort + i*2), Protocol: apiv1.ProtocolTCP},
+			apiv1.ServicePort{Name: fmt.Sprintf("ue%d-rx", i), Port: int32(zmqBasePort + i*2 + 1), Protocol: apiv1.ProtocolTCP},
 		)
 	}
 	return &apiv1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: cr.Namespace,
-			Labels:    labelsFor(cr, "radiobreaker"),
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cr.Namespace, Labels: labelsFor(cr, "radiobreaker")},
 		Spec: apiv1.ServiceSpec{
 			Selector: labelsFor(cr, "radiobreaker"),
 			Ports:    ports,
@@ -545,48 +638,39 @@ func buildRadioBreakerService(cr *srsranov1alpha1.SrsRanDeployment) *apiv1.Servi
 	}
 }
 
-// buildUEConfigMap creates a per-UE ConfigMap with the srsUE conf file filled
-// in with the appropriate ZMQ TX/RX addresses.
-//
-// zmqTarget is either "127.0.0.1" (single topology) or the RadioBreaker
-// service DNS name (multi topology).
-// zmqTXPort is the port this UE uses to TX to the DU/RadioBreaker.
+// buildUEConfigMap creates the per-UE srsUE config.
+// zmqTarget is either the DU Service DNS (single) or RadioBreaker Service DNS (multi).
+// zmqTXPort is the port this UE binds its TX to on the target side.
 func (r *SrsRanDeploymentReconciler) buildUEConfigMap(
-	cr *srsranov1alpha1.SrsRanDeployment,
-	index int,
-	zmqTarget string,
-	zmqTXPort int,
+	cr *srsranov1alpha1.SrsRanDeployment, index int, zmqTarget string, zmqTXPort int,
 ) (*apiv1.ConfigMap, error) {
-	zmqRXPort := zmqTXPort + 1
 	ueCfg, err := renderUEConfig(UEConfigValues{
 		ZMQTarget: zmqTarget,
 		ZMQTXPort: zmqTXPort,
-		ZMQRXPort: zmqRXPort,
+		ZMQRXPort: zmqTXPort + 1,
 		PLMN:      cr.Spec.Topology.PLMN,
 		FiveQI:    cr.Spec.SliceIntent.FiveQI,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to render UE[%d] config: %w", index, err)
+		return nil, fmt.Errorf("renderUEConfig[%d]: %w", index, err)
 	}
-	cmName := fmt.Sprintf("%s-ue-%d", cr.Name, index)
-	return buildConfigMap(cmName, cr.Namespace, map[string]string{"ue.conf": ueCfg}), nil
+	return buildConfigMap(fmt.Sprintf("%s-ue-%d", cr.Name, index), cr.Namespace,
+		map[string]string{"ue.conf": ueCfg}), nil
 }
 
-// ─── Reconcile helpers (create-or-update pattern) ───────────────────────────
+// ─── Reconcile helpers (create-or-update) ───────────────────────────────────
 
 type minimalLogger interface{ Info(string, ...any) }
 
 func (r *SrsRanDeploymentReconciler) reconcileConfigMap(
-	ctx context.Context,
-	owner *srsranov1alpha1.SrsRanDeployment,
-	desired *apiv1.ConfigMap,
-	log minimalLogger,
+	ctx context.Context, owner *srsranov1alpha1.SrsRanDeployment,
+	desired *apiv1.ConfigMap, log minimalLogger,
 ) error {
 	existing := new(apiv1.ConfigMap)
 	err := r.Client.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
 	if k8serrors.IsNotFound(err) {
-		if setErr := ctrl.SetControllerReference(owner, desired, r.Scheme); setErr != nil {
-			return setErr
+		if err2 := ctrl.SetControllerReference(owner, desired, r.Scheme); err2 != nil {
+			return err2
 		}
 		log.Info("Creating ConfigMap", "name", desired.Name)
 		return r.Client.Create(ctx, desired)
@@ -594,23 +678,20 @@ func (r *SrsRanDeploymentReconciler) reconcileConfigMap(
 	if err != nil {
 		return err
 	}
-	// Update data in place.
 	existing.Data = desired.Data
 	log.Info("Updating ConfigMap", "name", desired.Name)
 	return r.Client.Update(ctx, existing)
 }
 
 func (r *SrsRanDeploymentReconciler) reconcileDeployment(
-	ctx context.Context,
-	owner *srsranov1alpha1.SrsRanDeployment,
-	desired *appsv1.Deployment,
-	log minimalLogger,
+	ctx context.Context, owner *srsranov1alpha1.SrsRanDeployment,
+	desired *appsv1.Deployment, log minimalLogger,
 ) error {
 	existing := new(appsv1.Deployment)
 	err := r.Client.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
 	if k8serrors.IsNotFound(err) {
-		if setErr := ctrl.SetControllerReference(owner, desired, r.Scheme); setErr != nil {
-			return setErr
+		if err2 := ctrl.SetControllerReference(owner, desired, r.Scheme); err2 != nil {
+			return err2
 		}
 		log.Info("Creating Deployment", "name", desired.Name)
 		return r.Client.Create(ctx, desired)
@@ -618,23 +699,20 @@ func (r *SrsRanDeploymentReconciler) reconcileDeployment(
 	if err != nil {
 		return err
 	}
-	// Preserve resource version and update spec.
 	desired.ResourceVersion = existing.ResourceVersion
 	log.Info("Updating Deployment", "name", desired.Name)
 	return r.Client.Update(ctx, desired)
 }
 
 func (r *SrsRanDeploymentReconciler) reconcileService(
-	ctx context.Context,
-	owner *srsranov1alpha1.SrsRanDeployment,
-	desired *apiv1.Service,
-	log minimalLogger,
+	ctx context.Context, owner *srsranov1alpha1.SrsRanDeployment,
+	desired *apiv1.Service, log minimalLogger,
 ) error {
 	existing := new(apiv1.Service)
 	err := r.Client.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
 	if k8serrors.IsNotFound(err) {
-		if setErr := ctrl.SetControllerReference(owner, desired, r.Scheme); setErr != nil {
-			return setErr
+		if err2 := ctrl.SetControllerReference(owner, desired, r.Scheme); err2 != nil {
+			return err2
 		}
 		log.Info("Creating Service", "name", desired.Name)
 		return r.Client.Create(ctx, desired)
@@ -642,7 +720,6 @@ func (r *SrsRanDeploymentReconciler) reconcileService(
 	if err != nil {
 		return err
 	}
-	// Preserve ClusterIP assigned by Kubernetes.
 	desired.Spec.ClusterIP = existing.Spec.ClusterIP
 	desired.ResourceVersion = existing.ResourceVersion
 	log.Info("Updating Service", "name", desired.Name)
@@ -652,67 +729,60 @@ func (r *SrsRanDeploymentReconciler) reconcileService(
 // ─── Status sync ─────────────────────────────────────────────────────────────
 
 func (r *SrsRanDeploymentReconciler) syncStatus(
-	ctx context.Context,
-	cr *srsranov1alpha1.SrsRanDeployment,
+	ctx context.Context, cr *srsranov1alpha1.SrsRanDeployment,
 	topology srsranov1alpha1.TopologyType,
 ) error {
 	patch := cr.DeepCopy()
 	patch.Status.ObservedGeneration = cr.Generation
 	patch.Status.ActiveTopology = topology
 
-	// Count ready UE pods.
 	var readyUEs int32
 	for i := 0; i < cr.Spec.Topology.UECount; i++ {
 		dep := new(appsv1.Deployment)
-		name := fmt.Sprintf("%s-ue-%d", cr.Name, i)
-		if err := r.Client.Get(ctx,
-			types.NamespacedName{Name: name, Namespace: cr.Namespace}, dep); err == nil {
+		if err := r.Client.Get(ctx, types.NamespacedName{
+			Name:      fmt.Sprintf("%s-ue-%d", cr.Name, i),
+			Namespace: cr.Namespace,
+		}, dep); err == nil {
 			readyUEs += dep.Status.ReadyReplicas
 		}
 	}
 	patch.Status.ReadyUEs = readyUEs
 
-	readyCond := metav1.Condition{
+	allReady := readyUEs == int32(cr.Spec.Topology.UECount)
+	cond := metav1.Condition{
 		Type:               string(srsranov1alpha1.ConditionTypeReady),
 		ObservedGeneration: cr.Generation,
 		LastTransitionTime: metav1.Now(),
 	}
-	if readyUEs == int32(cr.Spec.Topology.UECount) {
-		readyCond.Status = metav1.ConditionTrue
-		readyCond.Reason = "AllUEsReady"
-		readyCond.Message = fmt.Sprintf("%d/%d UEs ready", readyUEs, cr.Spec.Topology.UECount)
+	if allReady {
+		cond.Status, cond.Reason = metav1.ConditionTrue, "AllUEsReady"
+		cond.Message = fmt.Sprintf("%d/%d UEs ready", readyUEs, cr.Spec.Topology.UECount)
 	} else {
-		readyCond.Status = metav1.ConditionFalse
-		readyCond.Reason = "UEsNotReady"
-		readyCond.Message = fmt.Sprintf("%d/%d UEs ready", readyUEs, cr.Spec.Topology.UECount)
+		cond.Status, cond.Reason = metav1.ConditionFalse, "UEsNotReady"
+		cond.Message = fmt.Sprintf("%d/%d UEs ready", readyUEs, cr.Spec.Topology.UECount)
 	}
-	patch.Status.Conditions = []metav1.Condition{readyCond}
-
+	patch.Status.Conditions = []metav1.Condition{cond}
 	return r.Status().Update(ctx, patch)
 }
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
-// extractHost parses a CIDR or bare IP and returns the host portion only.
-// Returns an error if the input is empty or unparseable (used to detect
-// whether Nephio IPAM has injected the IP yet).
+// extractHost parses a CIDR or bare IP and returns just the host part.
+// Returns an error if the string is empty or unparseable, which signals that
+// Nephio IPAM has not injected this field yet.
 func extractHost(cidrOrIP string) (string, error) {
 	if cidrOrIP == "" {
 		return "", fmt.Errorf("empty IP address")
 	}
-	// Try CIDR first.
-	ip, _, err := net.ParseCIDR(cidrOrIP)
-	if err == nil {
+	if ip, _, err := net.ParseCIDR(cidrOrIP); err == nil {
 		return ip.String(), nil
 	}
-	// Bare IP.
-	if parsed := net.ParseIP(cidrOrIP); parsed != nil {
-		return parsed.String(), nil
+	if ip := net.ParseIP(cidrOrIP); ip != nil {
+		return ip.String(), nil
 	}
 	return "", fmt.Errorf("cannot parse IP/CIDR %q", cidrOrIP)
 }
 
-// labelsFor returns the common label set for a component within an SrsRanDeployment.
 func labelsFor(cr *srsranov1alpha1.SrsRanDeployment, component string) map[string]string {
 	return map[string]string{
 		"app.kubernetes.io/name":      "srsran",
@@ -721,7 +791,6 @@ func labelsFor(cr *srsranov1alpha1.SrsRanDeployment, component string) map[strin
 	}
 }
 
-// labelsForUE returns per-UE labels that include the UE index.
 func labelsForUE(cr *srsranov1alpha1.SrsRanDeployment, index int) map[string]string {
 	l := labelsFor(cr, "ue")
 	l["srsran.nephio.org/ue-index"] = fmt.Sprintf("%d", index)

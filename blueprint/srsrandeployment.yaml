@@ -15,14 +15,11 @@ spec:
   # The operator will read fiveQI and map it to PDCP/RLC/scheduler parameters
   # via its internal 5QI profile table.
   sliceIntent:
-    # Slice category: eMBB | URLLC | mMTC
+    # Slice category: eMBB | URLLC
     type: eMBB
-    # 5G QoS Identifier:
-    #   9  → eMBB best-effort (default video/internet)
-    #   7  → eMBB real-time video
-    #   5  → eMBB IMS voice
-    #   85 → URLLC mission-critical (lowest latency)
-    #   1  → URLLC (< 20 ms)
+    # 5G QoS Identifier – only the following six values are supported:
+    #   eMBB:  9 (default bearer), 7 (real-time video), 10 (video buffered)
+    #   URLLC: 82, 84, 85 (mission-critical / low-latency)
     fiveQI: 9
     # Optional hints – used for documentation and future capacity planning.
     maxLatencyMs: "300ms"
@@ -42,18 +39,36 @@ spec:
   # ─── Interfaces ─────────────────────────────────────────────────────────────
   # These fields are intentionally LEFT EMPTY here.
   # The Nephio interface-fn KRM function will read the companion interface-*.yaml
-  # files in this package and inject real IP addresses (CIDR format) into these
-  # fields during package specialization, before the operator reconciles.
+  # files and inject real IP addresses (CIDR format) into these fields
+  # during package specialization, before the operator reconciles.
+  #
+  # Interface → Pod mapping:
+  #   n2   → CU-CP  (NGAP control plane to AMF, vpc-ran)
+  #   n3   → CU-UP  (GTP-U user plane to UPF, vpc-ran)
+  #   e1   → CU-CP + CU-UP  (E1AP inter-CU, vpc-internal)
+  #   f1c  → CU-CP + DU  (F1-AP control, vpc-internal)
+  #   f1u  → CU-UP + DU  (F1-U user plane, vpc-internal)
   interfaces:
+    n2:
+      name: n2
+      # ipAddress: ""   ← filled by interface-fn at specialization time
+      # gateway: ""     ← filled by interface-fn at specialization time
     n3:
       name: n3
       # ipAddress: ""   ← filled by interface-fn at specialization time
-      # gateway: ""     ← filled by interface-fn at specialization time
-    f1:
-      name: f1
+    e1:
+      name: e1
+      # ipAddress: ""   ← filled by interface-fn at specialization time
+    f1c:
+      name: f1c
+      # ipAddress: ""   ← filled by interface-fn at specialization time
+    f1u:
+      name: f1u
       # ipAddress: ""   ← filled by interface-fn at specialization time
 
-  # ─── Container Images ───────────────────────────────────────────────────────
-  duImage: "docker.io/softwareradiosystems/srsran-project:latest"
-  ueImage: "docker.io/softwareradiosystems/srsue:latest"
+  # ─── Container Images ────────────────────────────────────────────────────
+  cucpImage:         "docker.io/softwareradiosystems/srsran-project:latest"
+  cuupImage:         "docker.io/softwareradiosystems/srsran-project:latest"
+  duImage:           "docker.io/softwareradiosystems/srsran-project:latest"
+  ueImage:           "docker.io/softwareradiosystems/srsue:latest"
   radioBreakerImage: "docker.io/softwareradiosystems/radio-breaker:latest"

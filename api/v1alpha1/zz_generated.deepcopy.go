@@ -90,9 +90,6 @@ func (in *SrsRanDeploymentList) DeepCopyObject() runtime.Object {
 // DeepCopyInto copies all properties of SrsRanDeploymentSpec into out.
 func (in *SrsRanDeploymentSpec) DeepCopyInto(out *SrsRanDeploymentSpec) {
 	*out = *in
-	out.SliceIntent = in.SliceIntent
-	out.Topology = in.Topology
-	in.Interfaces.DeepCopyInto(&out.Interfaces)
 }
 
 // DeepCopy creates a deep copy of SrsRanDeploymentSpec.
@@ -108,13 +105,11 @@ func (in *SrsRanDeploymentSpec) DeepCopy() *SrsRanDeploymentSpec {
 // DeepCopyInto copies all properties of InterfacesSpec into out.
 func (in *InterfacesSpec) DeepCopyInto(out *InterfacesSpec) {
 	*out = *in
+	out.N2 = in.N2
 	out.N3 = in.N3
-	out.F1 = in.F1
-	if in.SBA != nil {
-		in, out := &in.SBA, &out.SBA
-		*out = new(InterfaceIPStatus)
-		**out = **in
-	}
+	out.E1 = in.E1
+	out.F1C = in.F1C
+	out.F1U = in.F1U
 }
 
 // DeepCopy creates a deep copy of InterfacesSpec.

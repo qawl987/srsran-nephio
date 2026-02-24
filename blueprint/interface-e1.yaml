@@ -1,17 +1,19 @@
 apiVersion: req.nephio.org/v1alpha1
 kind: Interface
 metadata:
-  name: n3
+  name: e1
   annotations:
     # interface-fn reads these annotations to look up the IP pool and writes
-    # the allocated CIDR back into SrsRanDeployment.spec.interfaces.n3.
-    nephio.org/network-name: n3
+    # the allocated CIDR back into SrsRanDeployment.spec.interfaces.e1.
+    # E1 is the E1AP interface between the CU-CP and the CU-UP (O-RAN E1).
+    # Both CU-CP and CU-UP pods bind their E1AP sockets to this IP.
+    nephio.org/network-name: e1
     config.kubernetes.io/local-config: "true"
     specializer.nephio.org/owner: workload.nephio.org/v1alpha1.SrsRanDeployment.srsran-example
     specializer.nephio.org/namespace: srsran-example
 spec:
-  # vpc-ran: carries GTP-U user-plane traffic between CU-UP and the UPF.
+  # vpc-internal: cluster-internal network for CU-CP ↔ CU-UP E1AP traffic.
   networkInstance:
-    name: vpc-ran
+    name: vpc-internal
   cniType: macvlan
   attachmentType: vlan

@@ -6,24 +6,27 @@ metadata:
     config.kubernetes.io/local-config: "true"
 info:
   description: |
-    srsRAN blueprint package for Nephio.
+    srsRAN blueprint package for Nephio – disaggregated O-RAN architecture.
 
-    This package represents a complete, intent-driven srsRAN gNB (DU +
-    optional CU split) and simulated UE environment.  Real IP addresses are
-    injected by the Nephio specialization pipeline before the
-    srsran-operator reconciles the package into running Kubernetes workloads.
+    This package deploys three separate pods per SrsRanDeployment:
+      CU-CP  – binds N2 (NGAP→AMF), E1 (E1AP server), F1C (F1-AP server)
+      CU-UP  – binds N3 (GTP-U→UPF), E1 (E1AP client), F1U (GTP-U→DU)
+      DU     – binds F1C/F1U (←CU), ZMQ RF (→UE or RadioBreaker)
+
+    All inter-pod addresses are real routed IPs injected by Nephio IPAM.
+    Loopback addresses (127.x.x.x) are never used.
 
     Lifecycle summary:
       1. A user creates a PackageRevision referencing this blueprint.
-      2. Nephio's apply-replacements functions propagates the package name and
+      2. Nephio's apply-replacements propagates the package name and
          namespace into the Interface / Capacity resource annotations.
-      3. interface-fn allocates N3 (RAN ↔ UPF GTP-U) and F1 (CU ↔ DU) IPs
-         from the cluster's IPAM pool and writes them into
-         spec.interfaces.n3.ipAddress and spec.interfaces.f1.ipAddress.
+      3. interface-fn allocates five IPs (N2, N3, E1, F1C, F1U) from the
+         cluster's IPAM pools and writes them into
+         spec.interfaces.{n2,n3,e1,f1c,f1u}.ipAddress.
       4. nfdeploy-fn converts the SrsRanDeployment spec into the canonical
          NFDeployment shape expected by the srsran-operator.
-      5. The srsran-operator reads the injected IPs and deploys the DU,
-         UE(s), and optional RadioBreaker Deployments.
+      5. The srsran-operator reads the injected IPs and deploys CU-CP, CU-UP,
+         DU, UE(s), and optional RadioBreaker pods.
   keywords:
     - srsran
     - ran
@@ -46,9 +49,9 @@ pipeline:
       configPath: package-context.yaml
 
     # ── Step 4: allocate IPs for every Interface resource in the package ──
-    #   Reads Interface.spec.networkInstance and writes the allocated
-    #   CIDR into SrsRanDeployment.spec.interfaces.<name>.ipAddress via the
-    #   specializer.nephio.org/owner annotation.
+    #   Interface resources: n2, n3, e1, f1c, f1u
+    #   Each gets its CIDR written back into the SrsRanDeployment CR via the
+    #   specializer.nephio.org/owner annotation on each Interface resource.
     - image: docker.io/nephio/interface-fn:latest
 
     # ── Step 5: create NetworkAttachmentDefinitions for multus ──

@@ -27,22 +27,16 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 // QoS ConfigMap template
 //
-// Mapping rules (aligned with ETSI TS 23.501 Table 5.7.4-1):
+// Exactly six 5QI profiles are supported (ETSI TS 23.501 Table 5.7.4-1):
 //
-//  5QI  | Slice   | PDCP DiscardTimer | RLC Mode | Scheduler priority
-//  -----+---------+-------------------+----------+--------------------
-//  1    | URLLC   | 20 ms             | UM       | 240 (highest)
-//  2    | URLLC   | 50 ms             | UM       | 220
-//  4    | URLLC   | 50 ms             | UM       | 200
-//  65   | URLLC   | 70 ms             | UM       | 180
-//  82   | URLLC   | 100 ms            | AM       | 160
-//  85   | URLLC   | 10 ms             | UM       | 250 (mission-critical)
-//  5    | eMBB    | 100 ms            | AM       | 80
-//  7    | eMBB    | 100 ms            | UM       | 60
-//  8    | eMBB    | 300 ms            | AM       | 40
-//  9    | eMBB    | 300 ms            | AM       | 20 (default)
-//  70   | mMTC    | 0 (no discard)    | AM       | 10 (lowest)
-//  79   | mMTC    | 0 (no discard)    | AM       | 5
+//  5QI  | Slice | PDCP DiscardTimer | RLC Mode | Scheduler priority
+//  -----+-------+-------------------+----------+--------------------
+//  9    | eMBB  | 300 ms            | AM       | 20  (default bearer)
+//  7    | eMBB  | 100 ms            | UM       | 60
+//  10   | eMBB  | 100 ms            | UM       | 50
+//  82   | URLLC | 100 ms            | AM       | 160
+//  84   | URLLC | 10 ms             | UM       | 230
+//  85   | URLLC | 10 ms             | UM       | 250 (mission-critical)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // qosProfile holds the per-5QI radio parameters that feed the QoS template.
@@ -57,23 +51,18 @@ type qosProfile struct {
 	GBREnabled         bool
 }
 
-// fiveQIProfiles maps 5QI → qosProfile. Unknown 5QIs fall back to 5QI=9.
+// fiveQIProfiles maps 5QI → qosProfile.
+// Only six 5QIs are supported: eMBB {9, 7, 10} and URLLC {82, 84, 85}.
+// Unknown 5QIs fall back to 5QI=9 (eMBB default bearer).
 var fiveQIProfiles = map[int]qosProfile{
-	// ── URLLC ──
-	85: {85, srsranov1alpha1.SliceTypeURLLC, 10, "UM", 250, 1.0, true, true},
-	1:  {1, srsranov1alpha1.SliceTypeURLLC, 20, "UM", 240, 1.0, true, true},
-	2:  {2, srsranov1alpha1.SliceTypeURLLC, 50, "UM", 220, 1.5, true, true},
-	4:  {4, srsranov1alpha1.SliceTypeURLLC, 50, "UM", 200, 1.5, true, true},
-	65: {65, srsranov1alpha1.SliceTypeURLLC, 70, "UM", 180, 2.0, true, true},
-	82: {82, srsranov1alpha1.SliceTypeURLLC, 100, "AM", 160, 2.0, false, true},
 	// ── eMBB ──
-	5: {5, srsranov1alpha1.SliceTypeMBB, 100, "AM", 80, 3.0, false, false},
-	7: {7, srsranov1alpha1.SliceTypeMBB, 100, "UM", 60, 3.0, false, false},
-	8: {8, srsranov1alpha1.SliceTypeMBB, 300, "AM", 40, 4.0, false, false},
-	9: {9, srsranov1alpha1.SliceTypeMBB, 300, "AM", 20, 5.0, false, false},
-	// ── mMTC ──
-	70: {70, srsranov1alpha1.SliceTypeMMTC, 0, "AM", 10, 5.0, false, false},
-	79: {79, srsranov1alpha1.SliceTypeMMTC, 0, "AM", 5, 5.0, false, false},
+	9:  {9, srsranov1alpha1.SliceTypeMBB, 300, "AM", 20, 5.0, false, false},
+	7:  {7, srsranov1alpha1.SliceTypeMBB, 100, "UM", 60, 3.0, false, false},
+	10: {10, srsranov1alpha1.SliceTypeMBB, 100, "UM", 50, 3.5, false, false},
+	// ── URLLC ──
+	82: {82, srsranov1alpha1.SliceTypeURLLC, 100, "AM", 160, 2.0, false, true},
+	84: {84, srsranov1alpha1.SliceTypeURLLC, 10, "UM", 230, 1.0, true, true},
+	85: {85, srsranov1alpha1.SliceTypeURLLC, 10, "UM", 250, 1.0, true, true},
 }
 
 // qosTemplateSource is the Go template that produces the qos.yaml file
@@ -135,17 +124,107 @@ func renderQoSConfigMap(intent srsranov1alpha1.SliceIntent) (string, error) {
 // DU (gNB) configuration template
 // ─────────────────────────────────────────────────────────────────────────────
 
+// CUCPConfigValues holds the dynamic values injected into the CU-CP config.
+// All addresses are real routed IPs injected by Nephio IPAM – never loopback.
+type CUCPConfigValues struct {
+	N2BindAddr  string // NGAP bind address on N2 interface (CU-CP ↔ AMF)
+	AMFAddr     string // AMF NGAP address (gateway hint from N2 IPAM)
+	E1BindAddr  string // E1AP server bind address (CU-CP ↔ CU-UP)
+	F1CBindAddr string // F1-AP server bind address (CU-CP ↔ DU)
+	PLMN        string // 5-digit PLMN (MCC+MNC)
+	TAC         int    // Tracking Area Code
+}
+
+// CUUPConfigValues holds the dynamic values injected into the CU-UP config.
+// All addresses are real routed IPs injected by Nephio IPAM – never loopback.
+type CUUPConfigValues struct {
+	E1CUCPAddr  string // CU-CP Service DNS for E1AP client connection
+	E1BindAddr  string // E1AP client bind address on E1 interface
+	N3BindAddr  string // GTP-U bind address on N3 interface (CU-UP ↔ UPF)
+	F1UBindAddr string // F1-U GTP-U bind address on F1U interface (CU-UP ↔ DU)
+}
+
 // DUConfigValues holds the dynamic values injected into the DU config template.
 type DUConfigValues struct {
-	F1CUCPAddr string                    // CU-CP F1AP bind address (from N3 or F1 IPAM)
-	F1BindAddr string                    // DU F1AP bind address
-	N3Addr     string                    // DU GTP-U N3 address (injected by Nephio)
-	ZMQTarget  string                    // Hostname/IP of the ZMQ peer (UE or RadioBreaker)
-	ZMQTXPort  int                       // ZMQ TX port on the target
-	ZMQRXPort  int                       // ZMQ RX port on the target
-	PLMN       string                    // 5-digit PLMN (MCC+MNC)
-	TAC        int                       // Tracking Area Code
-	SliceType  srsranov1alpha1.SliceType // Used to choose scheduler policy
+	F1CUCPAddr  string                    // CU-CP Service DNS for F1-AP client
+	F1CBindAddr string                    // DU F1-AP (control) bind address
+	F1UBindAddr string                    // DU F1-U (user plane) bind address
+	ZMQTarget   string                    // DNS of the ZMQ peer (UE or RadioBreaker)
+	ZMQTXPort   int                       // ZMQ TX port on the target
+	ZMQRXPort   int                       // ZMQ RX port on the target
+	PLMN        string                    // 5-digit PLMN (MCC+MNC)
+	TAC         int                       // Tracking Area Code
+	SliceType   srsranov1alpha1.SliceType // Used to choose scheduler policy
+}
+
+const cucpConfigTemplateSource = `# Auto-generated by srsran-operator – DO NOT EDIT
+# CU-CP: N2={{ .N2BindAddr }} E1={{ .E1BindAddr }} F1C={{ .F1CBindAddr }}
+
+cu_cp:
+  amf:
+    addr:      {{ .AMFAddr }}
+    bind_addr: {{ .N2BindAddr }}
+  e1ap:
+    bind_addr: {{ .E1BindAddr }}
+  f1ap:
+    bind_addr: {{ .F1CBindAddr }}
+  cell_cfg:
+    plmn: "{{ .PLMN }}"
+    tac:  {{ .TAC }}
+
+log:
+  filename: /tmp/cu_cp.log
+  all_level: info
+
+pcap:
+  n2_enable: false
+  e1ap_enable: false
+  f1ap_enable: false
+`
+
+var cucpConfigTemplate = template.Must(template.New("cu-cp-config").Parse(cucpConfigTemplateSource))
+
+// renderCUCPConfig renders the srsRAN CU-CP YAML configuration.
+func renderCUCPConfig(v CUCPConfigValues) (string, error) {
+	var buf bytes.Buffer
+	if err := cucpConfigTemplate.Execute(&buf, v); err != nil {
+		return "", fmt.Errorf("renderCUCPConfig: %w", err)
+	}
+	return buf.String(), nil
+}
+
+const cuupConfigTemplateSource = `# Auto-generated by srsran-operator – DO NOT EDIT
+# CU-UP: E1CUCPAddr={{ .E1CUCPAddr }} E1={{ .E1BindAddr }} N3={{ .N3BindAddr }} F1U={{ .F1UBindAddr }}
+
+cu_up:
+  e1ap:
+    cu_cp_addr: {{ .E1CUCPAddr }}
+    bind_addr:  {{ .E1BindAddr }}
+  ngu:
+    bind_addr: {{ .N3BindAddr }}
+  f1u:
+    socket:
+      - bind_addr: {{ .F1UBindAddr }}
+
+log:
+  filename: /tmp/cu_up.log
+  all_level: info
+
+pcap:
+  e1ap_enable: false
+  f1u_enable: false
+  n3_enable: false
+`
+
+var cuupConfigTemplate = template.Must(template.New("cu-up-config").Parse(cuupConfigTemplateSource))
+
+// renderCUUPConfig renders the srsRAN CU-UP YAML configuration.
+func renderCUUPConfig(v CUUPConfigValues) (string, error) {
+	var buf bytes.Buffer
+	if err := cuupConfigTemplate.Execute(&buf, v); err != nil {
+		return "", fmt.Errorf("renderCUUPConfig: %w", err)
+	}
+	return buf.String(), nil
 }
 
 const duConfigTemplateSource = `# Auto-generated by srsran-operator – DO NOT EDIT
@@ -153,11 +232,11 @@ const duConfigTemplateSource = `# Auto-generated by srsran-operator – DO NOT E
 
 f1ap:
   cu_cp_addr: {{ .F1CUCPAddr }}
-  bind_addr:  {{ .F1BindAddr }}
+  bind_addr:  {{ .F1CBindAddr }}
 
 f1u:
   socket:
-    - bind_addr: {{ .F1BindAddr }}
+    - bind_addr: {{ .F1UBindAddr }}
 
 ru_sdr:
   device_driver: zmq
@@ -186,11 +265,6 @@ cell_cfg:
         prio_enabled: true
         pdb_enabled: true
         gbr_enabled: true
-{{- else if eq .SliceType "mMTC" }}
-        pf_fairness_coeff: 5.0
-        prio_enabled: false
-        pdb_enabled: false
-        gbr_enabled: false
 {{- else }}
         # eMBB defaults
         pf_fairness_coeff: 2.0
