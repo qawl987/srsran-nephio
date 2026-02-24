@@ -1,0 +1,59 @@
+apiVersion: workload.nephio.org/v1alpha1
+kind: SrsRanDeployment
+metadata:
+  # The name is updated by apply-replacements-owner.yaml to include the cluster
+  # name suffix (e.g. "srsran-regional").
+  name: srsran-example
+  namespace: srsran-example
+  annotations:
+    # Nephio uses this annotation to understand which specializer should own
+    # this resource during the package specialization phase.
+    specializer.nephio.org/profile: ran
+spec:
+  # ─── Slice Intent ───────────────────────────────────────────────────────────
+  # Declare what kind of RAN slice this package should implement.
+  # The operator will read fiveQI and map it to PDCP/RLC/scheduler parameters
+  # via its internal 5QI profile table.
+  sliceIntent:
+    # Slice category: eMBB | URLLC | mMTC
+    type: eMBB
+    # 5G QoS Identifier:
+    #   9  → eMBB best-effort (default video/internet)
+    #   7  → eMBB real-time video
+    #   5  → eMBB IMS voice
+    #   85 → URLLC mission-critical (lowest latency)
+    #   1  → URLLC (< 20 ms)
+    fiveQI: 9
+    # Optional hints – used for documentation and future capacity planning.
+    maxLatencyMs: "300ms"
+    uplinkBandwidth: "20M"
+    downlinkBandwidth: "50M"
+
+  # ─── Topology ───────────────────────────────────────────────────────────────
+  topology:
+    # ueCount = 1 → single-UE topology (direct DU ↔ UE ZMQ)
+    # ueCount > 1 → multi-UE topology (DU ↔ RadioBreaker ↔ N×UE)
+    ueCount: 1
+    # Override auto-detection if needed: "single" | "multi"
+    # type: single
+    plmn: "20893"
+    tac: 1
+
+  # ─── Interfaces ─────────────────────────────────────────────────────────────
+  # These fields are intentionally LEFT EMPTY here.
+  # The Nephio interface-fn KRM function will read the companion interface-*.yaml
+  # files in this package and inject real IP addresses (CIDR format) into these
+  # fields during package specialization, before the operator reconciles.
+  interfaces:
+    n3:
+      name: n3
+      # ipAddress: ""   ← filled by interface-fn at specialization time
+      # gateway: ""     ← filled by interface-fn at specialization time
+    f1:
+      name: f1
+      # ipAddress: ""   ← filled by interface-fn at specialization time
+
+  # ─── Container Images ───────────────────────────────────────────────────────
+  duImage: "docker.io/softwareradiosystems/srsran-project:latest"
+  ueImage: "docker.io/softwareradiosystems/srsue:latest"
+  radioBreakerImage: "docker.io/softwareradiosystems/radio-breaker:latest"

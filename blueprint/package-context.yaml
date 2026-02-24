@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kptfile.kpt.dev
+  annotations:
+    config.kubernetes.io/local-config: "true"
+data:
+  # "name" is the package instance name.  It is set automatically by
+  # `kpt pkg get` to the local directory name, and propagated by
+  # apply-replacements-namespace.yaml into namespace fields.
+  name: srsran-example

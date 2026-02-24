@@ -1,0 +1,58 @@
+apiVersion: kpt.dev/v1
+kind: Kptfile
+metadata:
+  name: pkg-srsran
+  annotations:
+    config.kubernetes.io/local-config: "true"
+info:
+  description: |
+    srsRAN blueprint package for Nephio.
+
+    This package represents a complete, intent-driven srsRAN gNB (DU +
+    optional CU split) and simulated UE environment.  Real IP addresses are
+    injected by the Nephio specialization pipeline before the
+    srsran-operator reconciles the package into running Kubernetes workloads.
+
+    Lifecycle summary:
+      1. A user creates a PackageRevision referencing this blueprint.
+      2. Nephio's apply-replacements functions propagates the package name and
+         namespace into the Interface / Capacity resource annotations.
+      3. interface-fn allocates N3 (RAN ↔ UPF GTP-U) and F1 (CU ↔ DU) IPs
+         from the cluster's IPAM pool and writes them into
+         spec.interfaces.n3.ipAddress and spec.interfaces.f1.ipAddress.
+      4. nfdeploy-fn converts the SrsRanDeployment spec into the canonical
+         NFDeployment shape expected by the srsran-operator.
+      5. The srsran-operator reads the injected IPs and deploys the DU,
+         UE(s), and optional RadioBreaker Deployments.
+  keywords:
+    - srsran
+    - ran
+    - nephio
+    - 5g
+    - oran
+
+pipeline:
+  mutators:
+    # ── Step 1: propagate the package owner name into resource annotations ──
+    - image: ghcr.io/kptdev/krm-functions-catalog/apply-replacements:v0.1.1
+      configPath: apply-replacements-owner.yaml
+
+    # ── Step 2: propagate the package namespace into resource annotations ──
+    - image: ghcr.io/kptdev/krm-functions-catalog/apply-replacements:v0.1.1
+      configPath: apply-replacements-namespace.yaml
+
+    # ── Step 3: set the namespace on all resources ──
+    - image: ghcr.io/kptdev/krm-functions-catalog/set-namespace:v0.4.1
+      configPath: package-context.yaml
+
+    # ── Step 4: allocate IPs for every Interface resource in the package ──
+    #   Reads Interface.spec.networkInstance and writes the allocated
+    #   CIDR into SrsRanDeployment.spec.interfaces.<name>.ipAddress via the
+    #   specializer.nephio.org/owner annotation.
+    - image: docker.io/nephio/interface-fn:latest
+
+    # ── Step 5: create NetworkAttachmentDefinitions for multus ──
+    - image: docker.io/nephio/nad-fn:latest
+
+    # ── Step 6: inject capacity annotations based on Capacity resource ──
+    - image: docker.io/nephio/nfdeploy-fn:latest

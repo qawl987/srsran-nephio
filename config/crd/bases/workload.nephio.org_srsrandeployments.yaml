@@ -1,0 +1,219 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.12.0
+  name: srsrandeployments.workload.nephio.org
+spec:
+  group: workload.nephio.org
+  names:
+    kind: SrsRanDeployment
+    listKind: SrsRanDeploymentList
+    plural: srsrandeployments
+    shortNames:
+    - srsran
+    singular: srsrandeployment
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.sliceIntent.type
+      name: Slice
+      type: string
+    - jsonPath: .spec.sliceIntent.fiveQI
+      name: 5QI
+      type: integer
+    - jsonPath: .spec.topology.ueCount
+      name: UEs
+      type: integer
+    - jsonPath: .status.activeTopology
+      name: Topology
+      type: string
+    - jsonPath: .status.conditions[?(@.type=='Ready')].status
+      name: Ready
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: SrsRanDeployment is the Schema for the srsrandeployments API.
+        properties:
+          apiVersion:
+            type: string
+          kind:
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: SrsRanDeploymentSpec is the desired state of an SrsRanDeployment.
+            properties:
+              duImage:
+                default: docker.io/softwareradiosystems/srsran-project:latest
+                type: string
+              interfaces:
+                description: InterfacesSpec declares the network interfaces the operator
+                  expects Nephio to populate with real IP addresses.
+                properties:
+                  f1:
+                    description: InterfaceIPStatus holds the IP address injected by
+                      the Nephio IPAM function.
+                    properties:
+                      gateway:
+                        type: string
+                      ipAddress:
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  n3:
+                    description: InterfaceIPStatus holds the IP address injected by
+                      the Nephio IPAM function.
+                    properties:
+                      gateway:
+                        type: string
+                      ipAddress:
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  sba:
+                    description: InterfaceIPStatus holds the IP address injected by
+                      the Nephio IPAM function.
+                    properties:
+                      gateway:
+                        type: string
+                      ipAddress:
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - name
+                    type: object
+                required:
+                - f1
+                - n3
+                type: object
+              radioBreakerImage:
+                default: docker.io/softwareradiosystems/radio-breaker:latest
+                type: string
+              sliceIntent:
+                description: SliceIntent captures the high-level network slice QoS
+                  intent for the RAN.
+                properties:
+                  downlinkBandwidth:
+                    type: string
+                  fiveQI:
+                    default: 9
+                    maximum: 255
+                    minimum: 1
+                    type: integer
+                  maxLatencyMs:
+                    pattern: ^[0-9]+(ms)?$
+                    type: string
+                  type:
+                    default: eMBB
+                    enum:
+                    - eMBB
+                    - URLLC
+                    - mMTC
+                    type: string
+                  uplinkBandwidth:
+                    type: string
+                required:
+                - fiveQI
+                - type
+                type: object
+              topology:
+                description: TopologySpec describes the UE-side topology of the RAN
+                  emulation.
+                properties:
+                  plmn:
+                    default: "20893"
+                    type: string
+                  tac:
+                    default: 1
+                    type: integer
+                  type:
+                    enum:
+                    - single
+                    - multi
+                    type: string
+                  ueCount:
+                    default: 1
+                    minimum: 1
+                    type: integer
+                required:
+                - ueCount
+                type: object
+              ueImage:
+                default: docker.io/softwareradiosystems/srsue:latest
+                type: string
+            required:
+            - interfaces
+            - sliceIntent
+            - topology
+            type: object
+          status:
+            description: SrsRanDeploymentStatus is the observed state of an SrsRanDeployment.
+            properties:
+              activeTopology:
+                enum:
+                - single
+                - multi
+                type: string
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      format: date-time
+                      type: string
+                    message:
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              observedGeneration:
+                format: int64
+                type: integer
+              readyUEs:
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

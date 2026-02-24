@@ -1,0 +1,16 @@
+apiVersion: infra.nephio.org/v1alpha1
+kind: WorkloadCluster
+metadata:
+  name: workload-cluster
+  annotations:
+    config.kubernetes.io/local-config: "true"
+spec:
+  # clusterName is set by `kpt pkg get` or the Nephio Management Cluster
+  # when the package is instantiated for a target cluster.
+  # apply-replacements-owner.yaml reads this field to stamp the cluster name
+  # into the SrsRanDeployment name (e.g. "srsran-regional").
+  clusterName: example
+  cnis:
+    - macvlan
+    - ipvlan
+    - sriov

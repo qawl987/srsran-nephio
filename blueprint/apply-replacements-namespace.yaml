@@ -1,0 +1,27 @@
+apiVersion: fn.kpt.dev/v1alpha1
+kind: ApplyReplacements
+metadata:
+  name: propagate-namespace
+  annotations:
+    config.kubernetes.io/local-config: "true"
+# This function copies the package name (== namespace) from the kptfile.kpt.dev
+# ConfigMap into the "namespace" annotation on every Interface and Capacity
+# resource so that interface-fn can place IP allocations in the correct namespace.
+replacements:
+  - source:
+      kind: ConfigMap
+      name: kptfile.kpt.dev
+      fieldPath: data.name
+    targets:
+      - select:
+          kind: Interface
+        fieldPaths:
+          - metadata.annotations.[specializer.nephio.org/namespace]
+      - select:
+          kind: Capacity
+        fieldPaths:
+          - metadata.annotations.[specializer.nephio.org/namespace]
+      - select:
+          kind: SrsRanDeployment
+        fieldPaths:
+          - metadata.namespace

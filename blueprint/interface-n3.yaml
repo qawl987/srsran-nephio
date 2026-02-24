@@ -1,0 +1,22 @@
+apiVersion: req.nephio.org/v1alpha1
+kind: Interface
+metadata:
+  name: n3
+  annotations:
+    # The Nephio interface-fn reads these two annotations to look up the correct
+    # IP pool and then writes the allocated CIDR back into the SrsRanDeployment
+    # CR at the field path indicated by specializer.nephio.org/owner.
+    nephio.org/network-name: n3
+    config.kubernetes.io/local-config: "true"
+    # owner and namespace are filled in by apply-replacements-owner.yaml /
+    # apply-replacements-namespace.yaml during package specialization.
+    specializer.nephio.org/owner: workload.nephio.org/v1alpha1.SrsRanDeployment.srsran-example
+    specializer.nephio.org/namespace: srsran-example
+spec:
+  # vpc-ran is the network instance attached to the gNB N3 (GTP-U) interface.
+  # This must match the NetworkInstance name defined in the cluster's IPAM config.
+  networkInstance:
+    name: vpc-ran
+  # macvlan is the standard CNI type for multus secondary attachments in Nephio.
+  cniType: macvlan
+  attachmentType: vlan

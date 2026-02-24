@@ -1,0 +1,16 @@
+apiVersion: req.nephio.org/v1alpha1
+kind: Capacity
+metadata:
+  name: dataplane
+  annotations:
+    config.kubernetes.io/local-config: "true"
+    # nfdeploy-fn reads this annotation to link the capacity request back to
+    # the parent SrsRanDeployment CR.
+    specializer.nephio.org/owner: workload.nephio.org/v1alpha1.SrsRanDeployment.srsran-example
+    specializer.nephio.org/namespace: srsran-example
+spec:
+  # These values are informational hints to the Nephio scheduler for admission
+  # control and resource planning.  They do NOT directly configure Linux QDiscs;
+  # the operator handles actual resource requests/limits in Pod specs.
+  maxUplinkThroughput: 20M
+  maxDownlinkThroughput: 50M

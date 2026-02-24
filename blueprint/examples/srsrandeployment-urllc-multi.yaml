@@ -1,0 +1,35 @@
+apiVersion: workload.nephio.org/v1alpha1
+kind: SrsRanDeployment
+metadata:
+  # Example: URLLC slice with 3 UEs and RadioBreaker topology.
+  # Copy this file into a new package variant and adjust as needed.
+  name: srsran-urllc-multi
+  namespace: srsran-urllc-multi
+spec:
+  # ── URLLC Mission-Critical intent ─────────────────────────────────────────
+  sliceIntent:
+    type: URLLC
+    # 5QI=85 → mission-critical MPS (< 10 ms PDCP discard, UM, highest priority)
+    fiveQI: 85
+    maxLatencyMs: "10ms"
+    uplinkBandwidth: "10M"
+    downlinkBandwidth: "10M"
+
+  # ── Multi-UE RadioBreaker topology ────────────────────────────────────────
+  topology:
+    ueCount: 3          # triggers RadioBreaker deployment
+    # type: multi       # auto-inferred from ueCount > 1
+    plmn: "20893"
+    tac: 1
+
+  # ── Interfaces (filled by Nephio IPAM) ────────────────────────────────────
+  interfaces:
+    n3:
+      name: n3
+    f1:
+      name: f1
+
+  # ── Container images ──────────────────────────────────────────────────────
+  duImage: "docker.io/softwareradiosystems/srsran-project:latest"
+  ueImage: "docker.io/softwareradiosystems/srsue:latest"
+  radioBreakerImage: "docker.io/softwareradiosystems/radio-breaker:latest"
