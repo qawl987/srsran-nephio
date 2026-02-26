@@ -67,8 +67,11 @@ spec:
       # ipAddress: ""   ← filled by interface-fn at specialization time
 
   # ─── Container Images ────────────────────────────────────────────────────
-  cucpImage:         "docker.io/softwareradiosystems/srsran-project:latest"
-  cuupImage:         "docker.io/softwareradiosystems/srsran-project:latest"
-  duImage:           "docker.io/softwareradiosystems/srsran-project:latest"
-  ueImage:           "docker.io/softwareradiosystems/srsue:latest"
-  radioBreakerImage: "docker.io/softwareradiosystems/radio-breaker:latest"
+  # Images are built locally via `make build-image` / `make build-ue-image`
+  # and imported into microk8s with `make import` / `make import-ue`.
+  # imagePullPolicy is IfNotPresent so kubelet uses the local image store.
+  cucpImage:         "qawl987/srsran-split:latest"
+  cuupImage:         "qawl987/srsran-split:latest"
+  duImage:           "qawl987/srsran-split:latest"
+  ueImage:           "qawl987/srsran-ue:latest"
+  radioBreakerImage: "qawl987/srsran-ue:latest"

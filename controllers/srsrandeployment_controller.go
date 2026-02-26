@@ -336,7 +336,7 @@ func buildCUCPDeployment(cr *srsranov1alpha1.SrsRanDeployment, cmName, cmVersion
 	name := cr.Name + "-cucp"
 	img := cr.Spec.CUCPImage
 	if img == "" {
-		img = "docker.io/softwareradiosystems/srsran-project:latest"
+		img = "qawl987/srsran-split:latest"
 	}
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cr.Namespace, Labels: labelsFor(cr, "cucp")},
@@ -352,7 +352,7 @@ func buildCUCPDeployment(cr *srsranov1alpha1.SrsRanDeployment, cmName, cmVersion
 					Containers: []apiv1.Container{{
 						Name:            "cucp",
 						Image:           img,
-						ImagePullPolicy: apiv1.PullAlways,
+						ImagePullPolicy: apiv1.PullIfNotPresent,
 						Command:         []string{"/usr/local/bin/srscu_cp", "-c", "/srsran/config/cu_cp.yml"},
 						SecurityContext: &apiv1.SecurityContext{
 							Capabilities: &apiv1.Capabilities{Add: []apiv1.Capability{"NET_ADMIN"}},
@@ -400,7 +400,7 @@ func buildCUUPDeployment(cr *srsranov1alpha1.SrsRanDeployment, cmName, cmVersion
 	name := cr.Name + "-cuup"
 	img := cr.Spec.CUUPImage
 	if img == "" {
-		img = "docker.io/softwareradiosystems/srsran-project:latest"
+		img = "qawl987/srsran-split:latest"
 	}
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cr.Namespace, Labels: labelsFor(cr, "cuup")},
@@ -416,7 +416,7 @@ func buildCUUPDeployment(cr *srsranov1alpha1.SrsRanDeployment, cmName, cmVersion
 					Containers: []apiv1.Container{{
 						Name:            "cuup",
 						Image:           img,
-						ImagePullPolicy: apiv1.PullAlways,
+						ImagePullPolicy: apiv1.PullIfNotPresent,
 						Command:         []string{"/usr/local/bin/srscu_up", "-c", "/srsran/config/cu_up.yml"},
 						SecurityContext: &apiv1.SecurityContext{
 							Capabilities: &apiv1.Capabilities{Add: []apiv1.Capability{"NET_ADMIN"}},
@@ -447,7 +447,7 @@ func buildDUDeployment(cr *srsranov1alpha1.SrsRanDeployment, duCMName, qosCMName
 	name := cr.Name + "-du"
 	img := cr.Spec.DUImage
 	if img == "" {
-		img = "docker.io/softwareradiosystems/srsran-project:latest"
+		img = "qawl987/srsran-split:latest"
 	}
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cr.Namespace, Labels: labelsFor(cr, "du")},
@@ -463,7 +463,7 @@ func buildDUDeployment(cr *srsranov1alpha1.SrsRanDeployment, duCMName, qosCMName
 					Containers: []apiv1.Container{{
 						Name:            "du",
 						Image:           img,
-						ImagePullPolicy: apiv1.PullAlways,
+						ImagePullPolicy: apiv1.PullIfNotPresent,
 						Command:         []string{"/usr/local/bin/gnb", "-c", "/srsran/config/du.yml"},
 						SecurityContext: &apiv1.SecurityContext{
 							Capabilities: &apiv1.Capabilities{Add: []apiv1.Capability{"NET_ADMIN"}},
@@ -520,7 +520,7 @@ func buildUEDeployment(cr *srsranov1alpha1.SrsRanDeployment, index int, ueCMName
 	name := fmt.Sprintf("%s-ue-%d", cr.Name, index)
 	img := cr.Spec.UEImage
 	if img == "" {
-		img = "docker.io/softwareradiosystems/srsue:latest"
+		img = "qawl987/srsran-ue:latest"
 	}
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cr.Namespace, Labels: labelsForUE(cr, index)},
@@ -533,7 +533,7 @@ func buildUEDeployment(cr *srsranov1alpha1.SrsRanDeployment, index int, ueCMName
 					Containers: []apiv1.Container{{
 						Name:            "ue",
 						Image:           img,
-						ImagePullPolicy: apiv1.PullAlways,
+						ImagePullPolicy: apiv1.PullIfNotPresent,
 						Command:         []string{"/usr/local/bin/srsue", "/srsran/config/ue.conf"},
 						VolumeMounts: []apiv1.VolumeMount{
 							{Name: "ue-config", MountPath: "/srsran/config"},
@@ -565,7 +565,7 @@ func buildRadioBreakerDeployment(cr *srsranov1alpha1.SrsRanDeployment) *appsv1.D
 	name := cr.Name + "-radiobreaker"
 	img := cr.Spec.RadioBreakerImage
 	if img == "" {
-		img = "docker.io/softwareradiosystems/radio-breaker:latest"
+		img = "qawl987/srsran-ue:latest" // RadioBreaker uses the same UE image
 	}
 	uePorts := ""
 	for i := 0; i < cr.Spec.Topology.UECount; i++ {
